@@ -5,10 +5,12 @@ on:
     branches:
       - work/drama-stabilisation-multisource
       - work/drama-mvp-generaliste
+      - work/drama-extracteurs-verification
   pull_request:
     branches:
       - master
       - work/drama-stabilisation-multisource
+      - work/drama-mvp-generaliste
 
 jobs:
   tests:
@@ -27,6 +29,6 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
       - name: Python syntax
-        run: python -m compileall -q app.py engine.py dramafren_downloader.py sources.py tests
+        run: python -m compileall -q app.py engine.py dramafren_downloader.py sources.py browser_session.py tests
       - name: Unit and integration tests
         run: python -m unittest discover -s tests -v

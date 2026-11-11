@@ -365,6 +365,39 @@ class GuiTests(unittest.TestCase):
         self.window.close()
         self.assertEqual(state_file.read_text(encoding="utf-8"), "{not valid json")
         self.assertTrue(self.window.state_file.exists())
+    def test_manual_verification_dialog_explains_retry(self):
+        from browser_session import BrowserVerificationDialog
+        dialog = BrowserVerificationDialog("https://example.org/video")
+        self.assertIn("Vérification", dialog.windowTitle())
+        self.assertIn("Réessayer", dialog.retry_button.text())
+        dialog.retry_button.click()
+        self.assertEqual(dialog.result(), 1)
+        dialog.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+    def test_cloudflare_error_requires_human_intervention(self):
+        jobs = [{**INFO, "id": "1", "source": "idrama", "title": "Un"}]
+        worker = Worker(jobs, self.tmp.name, 1)
+        states = []
+        worker.state.connect(lambda key, state: states.append((key, state)))
+        with patch("app.run_series", side_effect=RuntimeError("Cloudflare (HTTP 403)")):
+            worker.run()
+        self.assertEqual(states[-1], ("idrama:1", "intervention requise"))
+        worker.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+    def test_retry_after_verification_rechecks_the_actual_source(self):
+        url = DRAMA_URL
+        link = {"id": "101000643292", "source": "idrama",
+                "url": url, "state": "erreur", "error": "Cloudflare (HTTP 403)"}
+        self.window.data["pending_links"].append(link)
+        with patch("app.BrowserVerificationDialog") as dialog_class, \
+             patch.object(self.window, "next_link") as next_link:
+            dialog_class.return_value.exec.return_value = 1
+            self.window.open_verification(url, "idrama:101000643292")
+            next_link.assert_called_once()
+        self.assertEqual(link["state"], "en attente")
+        self.assertEqual(link["error"], "")
 
 
 if __name__ == "__main__":

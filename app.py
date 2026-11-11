@@ -3,6 +3,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from PySide6.QtCore import QThread, QTimer, Signal, Qt
 from PySide6.QtGui import QIcon
@@ -12,6 +13,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QFileDialog, QGridLayout
     QWidget)
 
 from sources import discover_any as discover, parse_any as parse_url
+from browser_session import BrowserVerificationDialog
 from engine import (Cancelled, Controller, assign_folder, load_queue, run_series,
                     save_queue, series_identity)
 
@@ -94,7 +96,8 @@ class Worker(QThread):
                 break
             except Exception as exc:
                 self.log.emit(f"{series['title']} : {exc}")
-                self.state.emit(ident, "erreur")
+                self.state.emit(ident, "intervention requise"
+                                if "cloudflare" in str(exc).lower() else "erreur")
 
 
 class Window(QMainWindow):
@@ -133,6 +136,7 @@ class Window(QMainWindow):
         self.pending_analyzer = None
         self.pending_current_id = None
         self.closing = False
+        self.verification_notified = set()
         self.worker = None
         self.progress_timer = QTimer(self)
         self.progress_timer.setSingleShot(True)
@@ -203,9 +207,11 @@ class Window(QMainWindow):
         self.retry_link = QPushButton("Réessayer l’analyse")
         self.remove_selected = QPushButton("Retirer la sélection")
         self.edit_selected = QPushButton("Options de la sélection")
+        self.verify_site = QPushButton("Vérifier le site")
         queue_controls.addWidget(self.retry_link)
         queue_controls.addWidget(self.remove_selected)
         queue_controls.addWidget(self.edit_selected)
+        queue_controls.addWidget(self.verify_site)
         queue_controls.addStretch()
         downloads_layout.addLayout(queue_controls)
         self.global_bar = QProgressBar()
@@ -246,6 +252,7 @@ class Window(QMainWindow):
         self.retry_link.clicked.connect(self.retry_selected)
         self.remove_selected.clicked.connect(self.remove_selection)
         self.edit_selected.clicked.connect(lambda: self.tabs.setCurrentIndex(0))
+        self.verify_site.clicked.connect(self.verify_selected)
         self.url.textChanged.connect(lambda: self.add.setEnabled(False))
         self.watch_clipboard.toggled.connect(self.clipboard_toggled)
         self.use_clipboard.clicked.connect(self.use_copied_url)
@@ -336,13 +343,17 @@ class Window(QMainWindow):
         if self.closing:
             return
         key = series_identity(info)
+        source_url = next((link["url"] for link in self.data["pending_links"]
+                           if pending_identity(link) == key), info.get("file_url"))
         self.data["pending_links"] = [
             l for l in self.data["pending_links"] if pending_identity(l) != key]
         if not any(series_identity(s) == key for s in self.data["series"]):
             series = {**info, "start": 1, "end": info["total"],
-                      "merge": info.get("source") != "direct" and self.merge_box.isChecked(),
+                      "merge": info.get("source") not in ("direct", "ytdlp") and self.merge_box.isChecked(),
                       "keep": self.keep_box.isChecked(),
                       "state": "en attente", "episodes": {}}
+            if source_url:
+                series["original_url"] = source_url
             assign_folder(series, self.destination.text(),
                           reserved={item["folder"] for item in self.data["series"]})
             self.data["series"].append(series)
@@ -364,6 +375,63 @@ class Window(QMainWindow):
         self.persist()
         self.render()
         self.buttons()
+        if "cloudflare" in error.lower():
+            link = next((l for l in self.data["pending_links"]
+                         if pending_identity(l) == ident), None)
+            if link:
+                self.suggest_verification(link["url"], ident)
+
+    def suggest_verification(self, url, key):
+        """Offer one dialog per site; never block work for unrelated sources."""
+        if not self.isVisible():
+            return
+        host = urlsplit(url).hostname
+        if not host or host in self.verification_notified:
+            return
+        self.verification_notified.add(host)
+        QTimer.singleShot(0, lambda url=url, key=key: self.open_verification(url, key))
+
+    def verify_selected(self):
+        entry = self.selected_entry()
+        if not entry:
+            return
+        kind, key = entry
+        if kind == "pending":
+            link = next((l for l in self.data["pending_links"]
+                         if pending_identity(l) == key), None)
+            url = link.get("url") if link else None
+        else:
+            series = self.series_for(key)
+            url = series.get("original_url") or series.get("file_url")
+        if url:
+            self.open_verification(url, key)
+        else:
+            self.journal.appendPlainText("Aucune URL d'origine enregistrée pour cette série.")
+
+    def open_verification(self, url, key):
+        dialog = BrowserVerificationDialog(url, self)
+        if not dialog.exec():
+            return
+        # Never assume a successful browser check: only a real retry confirms access.
+        pending = next((l for l in self.data["pending_links"]
+                        if pending_identity(l) == key), None)
+        if pending:
+            pending.update(state="en attente", error="")
+            self.persist()
+            self.render()
+            self.next_link()
+            return
+        try:
+            series = self.series_for(key)
+        except KeyError:
+            return
+        if self.worker and self.worker.isRunning():
+            self.journal.appendPlainText("Téléchargement actif : réessayez à la fin du traitement.")
+            return
+        series["state"] = "en attente"
+        self.persist()
+        self.render()
+        self.start_downloads()
 
     def use_copied_url(self):
         if self.pending_url:
@@ -418,17 +486,18 @@ class Window(QMainWindow):
             self.analyze.setEnabled(True)
 
     def analysis_ok(self, info):
-        self.preview = info
-        self.merge_box.setEnabled(info.get("source") != "direct")
-        self.merge_box.setChecked(info.get("source") != "direct")
+        self.preview = {**info, "original_url": self.url.text().strip()}
+        self.merge_box.setEnabled(info.get("source") not in ("direct", "ytdlp"))
+        self.merge_box.setChecked(info.get("source") not in ("direct", "ytdlp"))
         self.start_ep.setValue(1)
         maximum = info["total"]
         self.end_ep.setValue(maximum)
         self.start_ep.setMaximum(maximum)
         self.end_ep.setMaximum(maximum)
         label = " (titre indisponible, modifiable dans la file)" if info["title_unknown"] else ""
-        detail = ("fichier direct" if info.get("source") == "direct"
-                  else f"{info['total']} épisodes — langue {info['lang']} — serveur {info['server']}")
+        detail = ("fichier direct" if info.get("source") == "direct" else
+                  "vidéo reconnue par yt-dlp" if info.get("source") == "ytdlp" else
+                  f"{info['total']} épisodes — langue {info['lang']} — serveur {info['server']}")
         self.info.setText(f"{info['title']}{label} — {detail}")
         self.analysis_tree.clear()
         self.analysis_tree.addTopLevelItem(QTreeWidgetItem(
@@ -447,7 +516,7 @@ class Window(QMainWindow):
             QMessageBox.information(self, "Déjà présent", "Cette série est déjà dans la file.")
             return
         series = {**self.preview, "start": self.start_ep.value(), "end": self.end_ep.value(),
-                  "merge": self.preview.get("source") != "direct" and self.merge_box.isChecked(),
+                  "merge": self.preview.get("source") not in ("direct", "ytdlp") and self.merge_box.isChecked(),
                   "keep": self.keep_box.isChecked(),
                   "state": "en attente", "episodes": {}}
         assign_folder(series, self.destination.text(),
@@ -517,6 +586,7 @@ class Window(QMainWindow):
             pending_identity(l) == entry[1] and l["state"] == "erreur" for l in self.data["pending_links"]))
         self.apply_options.setEnabled(bool(entry) and entry[0] == "series" and not busy)
         self.edit_selected.setEnabled(bool(entry) and entry[0] == "series" and not busy)
+        self.verify_site.setEnabled(bool(entry) and not busy)
         if entry and entry[0] == "series":
             series = self.series_for(entry[1])
             maximum = series["total"]
@@ -524,8 +594,8 @@ class Window(QMainWindow):
             self.end_ep.setMaximum(maximum)
             self.start_ep.setValue(series["start"])
             self.end_ep.setValue(series["end"])
-            self.merge_box.setEnabled(series.get("source") != "direct")
-            self.merge_box.setChecked(series.get("merge", True) and series.get("source") != "direct")
+            self.merge_box.setEnabled(series.get("source") not in ("direct", "ytdlp"))
+            self.merge_box.setChecked(series.get("merge", True) and series.get("source") not in ("direct", "ytdlp"))
             self.keep_box.setChecked(series.get("keep", True))
 
     def link_is_running(self, ident):
@@ -574,7 +644,7 @@ class Window(QMainWindow):
             # Keep validated episodes; only the necessary operations must be rescheduled.
             series["state"] = "en attente"
         series.update(start=self.start_ep.value(), end=self.end_ep.value(),
-                      merge=series.get("source") != "direct" and self.merge_box.isChecked(),
+                      merge=series.get("source") not in ("direct", "ytdlp") and self.merge_box.isChecked(),
                       keep=self.keep_box.isChecked())
         self.persist()
         self.render()
@@ -648,11 +718,14 @@ class Window(QMainWindow):
         self.render()
 
     def on_state(self, ident, state):
-        self.series_for(ident)["state"] = state
+        series = self.series_for(ident)
+        series["state"] = state
         if self.progress_timer.isActive():
             self.progress_timer.stop()
         self.persist()
         self.render()
+        if state == "intervention requise" and series.get("original_url"):
+            self.suggest_verification(series["original_url"], ident)
 
     def on_prompt(self, text):
         self.worker.approved = QMessageBox.question(self, "Réencodage", text) == QMessageBox.StandardButton.Yes
