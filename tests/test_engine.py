@@ -10,7 +10,8 @@ from unittest.mock import patch
 
 from dramafren_downloader import (anyreel_metadata, anyreel_video, discover, dramabox_metadata,
                                    kiss18_metadata, kiss18_video, parse_url, query_details, reelshort_metadata)
-from engine import Controller, compatible, download_episode, existing_video, load_queue, merge, run_series, save_queue
+from engine import (Controller, assign_folder, compatible, download_episode, existing_video,
+                    load_queue, merge, run_series, save_queue, validate_queue, verified_merge)
 
 URL = "https://idrama.dramafren.org/index.php?page=watch&id=101000643292&ep=5&server=1&lang=en"
 DETAIL_URL = "https://idrama.dramafren.org/index.php?page=detail&id=100000643031&lang=en"
@@ -205,7 +206,9 @@ class EngineTests(unittest.TestCase):
     def test_queue_recovery(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "queue.json"
-            save_queue(path, {"series": [{"state": "téléchargement", "episodes": {"1": {"state": "pause"}}}]})
+            save_queue(path, {"series": [{"id": "1", "title": "Test", "total": 1,
+                                           "start": 1, "end": 1, "server": 1, "lang": "en",
+                                           "state": "téléchargement", "episodes": {"1": {"state": "pause"}}}]})
             recovered = load_queue(path)["series"][0]
             self.assertEqual(recovered["state"], "en attente")
             self.assertEqual(recovered["episodes"]["1"]["state"], "en attente")
@@ -301,6 +304,77 @@ class EngineTests(unittest.TestCase):
                 output = merge({"title": "My Cruel Mate", "start": 1, "end": 1, "total": 62},
                                folder, [1], controller, lambda _: False)
                 self.assertEqual(output.name, "My_Cruel_Mate_Episodes_01-01.mp4")
+
+    def test_queue_validation_rejects_broken_and_ambiguous_entries(self):
+        valid = {"series": [{"id": "7", "source": "idrama", "title": "Un", "total": 3,
+                             "start": 1, "end": 3, "server": 1, "lang": "en", "episodes": {}},
+                            {"id": "7", "source": "dramabox", "title": "Deux", "total": 3,
+                             "start": 1, "end": 3, "server": 1, "lang": "en", "episodes": {}}]}
+        validate_queue(valid)
+        for corrupt in (
+            {"series": [None]},
+            {"series": [{**valid["series"][0], "end": 9}]},
+            {"series": [valid["series"][0], valid["series"][0]]},
+            {"series": [{**valid["series"][0], "episodes": {"abc": {}}}]},
+            {"series": valid["series"], "pending_links": [{"id": "1", "state": "erreur"}]},
+            {"series": valid["series"], "parallel": 99},
+        ):
+            with self.subTest(corrupt=corrupt), self.assertRaises(ValueError):
+                validate_queue(corrupt)
+
+    def test_folder_is_stable_and_migrates_legacy_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = {"id": "123", "source": "dramabox", "title": "Ancien titre"}
+            old = Path(tmp) / "Ancien_titre_123"
+            old.mkdir()
+            self.assertEqual(assign_folder(s, tmp), old)
+            s["title"] = "Nouveau titre"
+            self.assertEqual(assign_folder(s, tmp), old)
+            fresh = {"id": "123", "source": "idrama", "title": "Série"}
+            # A legacy folder without source metadata must not be auto-copied
+            # to another known source in a way that corrupts its contents.
+            stable = assign_folder(fresh, tempfile.mkdtemp())
+            self.assertIn("idrama_123", str(stable))
+
+    def test_merge_does_not_trust_existing_unrelated_mp4(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            (folder / "Episode_01.mp4").write_bytes(b"episode")
+            original = folder / "Exemple_Complet.mp4"
+            original.write_bytes(b"not our merged video")
+            controller = Controller()
+            def fake_run(command, line=None):
+                if "null" not in command:
+                    Path(command[-1]).write_bytes(b"correct final video")
+            with patch("engine.probe", return_value=PROBE), patch.object(controller, "run", fake_run):
+                series = {"id": "1", "source": "idrama", "title": "Exemple",
+                          "start": 1, "end": 1, "total": 1, "server": 1, "lang": "en"}
+                output = merge(series, folder, [1], controller, lambda _: False)
+                self.assertEqual(output.name, "Exemple_Complet_Corrige_1.mp4")
+                self.assertEqual(original.read_bytes(), b"not our merged video")
+                self.assertTrue(Path(str(output) + ".manifest.json").exists())
+                self.assertEqual(verified_merge(series, folder, [1]), output)
+                again = merge(series, folder, [1], controller, lambda _: False)
+                self.assertEqual(again, output)
+                self.assertIsNone(verified_merge({**series, "source": "dramabox"}, folder, [1]))
+                (folder / "Episode_01.mp4").write_bytes(b"changed")
+                self.assertIsNone(verified_merge(series, folder, [1]))
+
+    def test_merge_manifest_survives_cleanup_of_episodes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            (folder / "Episode_01.mp4").write_bytes(b"episode")
+            controller = Controller()
+            def fake_run(command, line=None):
+                if "null" not in command:
+                    Path(command[-1]).write_bytes(b"assembled")
+            series = {"id": "1", "title": "Un", "total": 1, "start": 1, "end": 1,
+                      "server": 1, "lang": "en"}
+            with patch("engine.probe", return_value=PROBE), patch.object(controller, "run", fake_run):
+                output = merge(series, folder, [1], controller, lambda _: False, keep=False)
+                self.assertFalse((folder / "Episode_01.mp4").exists())
+                self.assertEqual(verified_merge(series, folder, [1]), output)
+                self.assertIsNone(verified_merge(series, folder, [1], require_sources=True))
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg indisponible")
     def test_real_ffmpeg_merge(self):
