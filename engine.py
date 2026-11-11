@@ -1,5 +1,6 @@
 """Téléchargement, reprise et concaténation ; indépendant de Qt."""
 import json
+import hashlib
 import importlib.util
 import os
 import re
@@ -154,21 +155,127 @@ def download_episode(series, episode, folder, controller, update):
     raise RuntimeError(f"Épisode {episode} : {error}")
 
 
+def series_identity(series):
+    """Unique logical series identity across providers."""
+    return f"{series.get('source', 'idrama')}:{series['id']}"
+
+
+def assign_folder(series, destination, reserved=None):
+    """Pin a stable folder, preserving old names without sharing two series' files."""
+    reserved = set(reserved or ())
+    destination = Path(destination)
+    if "folder" in series:
+        name = series["folder"]
+        if not isinstance(name, str) or not name or safe_name(name) != name or name in reserved:
+            raise ValueError("Dossier de série invalide ou déjà utilisé dans la file")
+        return destination / name
+    legacy = safe_name(series["title"] + "_" + series["id"])
+    stable = safe_name(series_identity(series).replace(":", "_"))
+    if (destination / legacy).is_dir() and legacy not in reserved:
+        name = legacy
+    else:
+        candidates = [p.name for p in destination.glob("*_" + series["id"])
+                      if p.is_dir() and safe_name(p.name) == p.name and p.name not in reserved]
+        name = candidates[0] if len(candidates) == 1 else stable
+    if name in reserved:
+        raise ValueError("Deux séries ne peuvent partager le même dossier")
+    series["folder"] = name
+    return destination / name
+
+def file_fingerprint(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {"size": Path(path).stat().st_size, "sha256": digest.hexdigest()}
+
+
+def merge_job(series, episodes):
+    return {"source": series.get("source", "idrama"), "id": series.get("id", ""),
+            "server": series.get("server", 1), "lang": series.get("lang", "en"),
+            "episodes": list(episodes), "format": "mp4"}
+
+
+def manifest_for(output):
+    return Path(str(output) + ".manifest.json")
+
+
+def write_json_atomic(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False,
+                                         encoding="utf-8") as file:
+            json.dump(data, file, ensure_ascii=False, indent=2)
+            file.flush()
+            os.fsync(file.fileno())
+            temp = Path(file.name)
+        os.replace(temp, path)
+    finally:
+        if temp is not None:
+            temp.unlink(missing_ok=True)
+
+
+def verified_merge(series, folder, episodes, require_sources=False):
+    """Only accept a final MP4 with a matching provenance and content checksum."""
+    requested = merge_job(series, episodes)
+    for sidecar in sorted(folder.glob("*.mp4.manifest.json")):
+        output = Path(str(sidecar)[:-len(".manifest.json")])
+        try:
+            manifest = json.loads(sidecar.read_text(encoding="utf-8"))
+            if manifest.get("version") != 1 or manifest.get("job") != requested:
+                continue
+            inputs = manifest.get("sources")
+            if not isinstance(inputs, list) or [x.get("episode") for x in inputs] != list(episodes):
+                continue
+            if not output.is_file() or file_fingerprint(output) != manifest.get("result"):
+                continue
+            probe(output)
+            for item in inputs:
+                path, _ = verified_episode(folder, item["episode"])
+                if path is None:
+                    if require_sources:
+                        break
+                    continue
+                if path.name != item.get("name") or file_fingerprint(path) != item.get("fingerprint"):
+                    break
+            else:
+                return output
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError, json.JSONDecodeError,
+                subprocess.TimeoutExpired):
+            continue
+    return None
+
+
 def merge(series, folder, episodes, controller, reencode_prompt, keep=True):
+    folder = Path(folder)
+    existing = verified_merge(series, folder, episodes, require_sources=keep)
+    if existing:
+        if not keep:
+            # Verified input fingerprints were checked by verified_merge.
+            for ep in episodes:
+                old = existing_video(folder, ep)
+                if old:
+                    old.unlink()
+        return existing
     checked = [verified_episode(folder, ep) for ep in episodes]
     paths = [path for path, _ in checked]
     if not paths or any(p is None for p in paths):
         raise RuntimeError("Fusion interdite : épisode manquant ou invalide")
     probes = [metadata for _, metadata in checked]
+    source_data = [{"episode": ep, "name": path.name, "fingerprint": file_fingerprint(path)}
+                   for ep, path in zip(episodes, paths)]
     complete = series.get("start", 1) == 1 and series.get("end", len(episodes)) == series.get("total", len(episodes))
     suffix = "Complet" if complete else f"Episodes_{episodes[0]:02d}-{episodes[-1]:02d}"
     output = folder / f"{safe_name(series['title'])}_{suffix}.mp4"
     if output.exists():
-        try:
-            probe(output)
-            return output
-        except (RuntimeError, ValueError):
-            raise RuntimeError(f"Fichier final existant non valide : {output}")
+        # Never overwrite an untrusted MP4, even if ffprobe considers it readable.
+        base = output.stem
+        index = 1
+        while output.exists() or manifest_for(output).exists():
+            output = folder / f"{base}_Corrige_{index}.mp4"
+            index += 1
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as listing:
         for path in paths:
             listing.write("file '" + str(path.resolve()).replace("'", "'\\''") + "'\n")
@@ -194,8 +301,6 @@ def merge(series, folder, episodes, controller, reencode_prompt, keep=True):
                 expected = sum(float(p["format"]["duration"]) for p in probes)
                 if abs(duration - expected) > max(2, expected * 0.03):
                     raise RuntimeError(f"Durée fusionnée incorrecte ({duration:.1f}s / {expected:.1f}s)")
-                # ffprobe ne contrôle que les en-têtes : décoder le fichier entier
-                # avant de supprimer éventuellement les épisodes originaux.
                 controller.run(["ffmpeg", "-hide_banner", "-nostdin", "-v", "error",
                                 "-xerror", "-i", str(temp), "-f", "null", "-"])
                 break
@@ -203,7 +308,13 @@ def merge(series, folder, episodes, controller, reencode_prompt, keep=True):
                 if encode or not reencode_prompt("Fusion directe impossible : réencoder en MP4 ?"):
                     raise
                 encode = True
+        result = file_fingerprint(temp)
+        controller.wait()
         os.replace(temp, output)
+        write_json_atomic(manifest_for(output), {
+            "version": 1, "job": merge_job(series, episodes),
+            "sources": source_data, "result": result, "reencoded": encode,
+        })
         if not keep:
             for path in paths:
                 path.unlink()
@@ -216,9 +327,19 @@ def merge(series, folder, episodes, controller, reencode_prompt, keep=True):
 def run_series(series, destination, parallel, controller, update, log, reencode_prompt):
     if not importlib.util.find_spec("yt_dlp") or not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
         raise RuntimeError("yt-dlp, ffmpeg et ffprobe sont requis (voir README)")
-    folder = Path(destination) / safe_name(series["title"] + "_" + series["id"])
+    folder = assign_folder(series, destination)
     folder.mkdir(parents=True, exist_ok=True)
     episodes = list(range(series["start"], series["end"] + 1))
+    if series.get("merge", True):
+        prior = verified_merge(series, folder, episodes, require_sources=series.get("keep", True))
+        if prior:
+            if not series.get("keep", True):
+                for ep in episodes:
+                    old = existing_video(folder, ep)
+                    if old:
+                        old.unlink()
+            log(f"Fusion déjà vérifiée : {prior}")
+            return
     if series.get("source") == "dramabox":
         controller.wait()
         current = dramabox_metadata(series["id"])
@@ -257,26 +378,99 @@ def run_series(series, destination, parallel, controller, update, log, reencode_
         log(f"Fusion validée : {output}")
 
 
+SERIES_STATES = {"en attente", "analyse", "téléchargement", "pause", "erreur",
+                 "terminé", "vérification", "assemblage", "intervention requise"}
+
+
+def validate_queue(data):
+    if not isinstance(data, dict) or not isinstance(data.get("series"), list):
+        raise ValueError("File invalide : séries absentes ou incorrectes")
+    if not isinstance(data.get("destination", str(Path.home() / "Downloads")), str):
+        raise ValueError("Destination invalide")
+    parallel = data.get("parallel", 1)
+    if type(parallel) is not int or not 1 <= parallel <= 3:
+        raise ValueError("Nombre de téléchargements parallèles invalide")
+    pending = data.get("pending_links", [])
+    if not isinstance(pending, list):
+        raise ValueError("Liens en attente invalides")
+    seen = set()
+    folders = set()
+    for index, item in enumerate(data["series"]):
+        if not isinstance(item, dict):
+            raise ValueError(f"Série {index} invalide")
+        for field in ("id", "title", "lang"):
+            if not isinstance(item.get(field), str) or not item[field].strip():
+                raise ValueError(f"Série {index} : champ {field} invalide")
+        if not isinstance(item.get("source", "idrama"), str) or not item.get("source", "idrama"):
+            raise ValueError(f"Série {index} : source invalide")
+        identity = series_identity(item)
+        if identity in seen:
+            raise ValueError(f"Série en double : {identity}")
+        seen.add(identity)
+        total = item.get("total")
+        start = item.get("start")
+        end = item.get("end")
+        if (type(total) is not int or type(start) is not int or type(end) is not int
+                or not 1 <= start <= end <= total <= 10000):
+            raise ValueError(f"Série {identity} : plage invalide")
+        if type(item.get("server")) is not int or item["server"] < 1:
+            raise ValueError(f"Série {identity} : serveur invalide")
+        if item.get("state", "en attente") not in SERIES_STATES:
+            raise ValueError(f"Série {identity} : état invalide")
+        if "folder" in item:
+            name = item["folder"]
+            if not isinstance(name, str) or not name or safe_name(name) != name or name in folders:
+                raise ValueError(f"Série {identity} : dossier invalide ou dupliqué")
+            folders.add(name)
+        for flag in ("merge", "keep"):
+            if flag in item and type(item[flag]) is not bool:
+                raise ValueError(f"Série {identity} : option {flag} invalide")
+        episodes = item.get("episodes", {})
+        if not isinstance(episodes, dict):
+            raise ValueError(f"Série {identity} : épisodes invalides")
+        for ep, value in episodes.items():
+            if not isinstance(ep, str) or not ep.isdecimal() or not 1 <= int(ep) <= total:
+                raise ValueError(f"Série {identity} : numéro d'épisode invalide")
+            if not isinstance(value, dict):
+                raise ValueError(f"Série {identity} : état d'épisode invalide")
+            if value.get("state", "en attente") not in SERIES_STATES:
+                raise ValueError(f"Série {identity} : état d'épisode inconnu")
+            percent = value.get("percent", 0)
+            if type(percent) not in (int, float) or not 0 <= percent <= 100:
+                raise ValueError(f"Série {identity} : progression invalide")
+    for index, link in enumerate(pending):
+        if (not isinstance(link, dict) or not isinstance(link.get("id"), str)
+                or not link["id"] or not isinstance(link.get("url"), str)
+                or not link["url"] or link.get("state") not in
+                {"en attente", "analyse", "erreur"} or not isinstance(link.get("error", ""), str)):
+            raise ValueError(f"Lien en attente {index} invalide")
+        if "source" in link and (not isinstance(link["source"], str) or not link["source"]):
+            raise ValueError(f"Lien en attente {index} : source invalide")
+    return data
+
+
 def load_queue(path):
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-        if not isinstance(data, dict) or not isinstance(data.get("series"), list):
-            raise ValueError("État invalide")
+        validate_queue(data)
+        data.setdefault("destination", str(Path.home() / "Downloads"))
+        data.setdefault("parallel", 1)
+        data.setdefault("pending_links", [])
         for series in data["series"]:
-            if series.get("state") in ("téléchargement", "pause"):
+            series.setdefault("source", "idrama")
+            series.setdefault("merge", True)
+            series.setdefault("keep", True)
+            series.setdefault("episodes", {})
+            if series.get("state") in ("téléchargement", "pause", "assemblage", "vérification"):
                 series["state"] = "en attente"
-            for episode in series.get("episodes", {}).values():
-                if episode.get("state") in ("téléchargement", "pause"):
+            for episode in series["episodes"].values():
+                if episode.get("state") in ("téléchargement", "pause", "assemblage", "vérification"):
                     episode["state"] = "en attente"
         return data
     except FileNotFoundError:
-        return {"series": [], "destination": str(Path.home() / "Downloads"), "parallel": 1}
+        return {"series": [], "pending_links": [],
+                "destination": str(Path.home() / "Downloads"), "parallel": 1}
 
 
 def save_queue(path, data):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False, encoding="utf-8") as file:
-        json.dump(data, file, ensure_ascii=False, indent=2)
-        temp = Path(file.name)
-    os.replace(temp, path)
+    write_json_atomic(path, data)

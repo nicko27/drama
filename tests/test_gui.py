@@ -136,7 +136,7 @@ class GuiTests(unittest.TestCase):
             with patch("app.discover", return_value=INFO):
                 clipboard.setText(DRAMA_URL)
                 self.assertEqual(self.window.data["pending_links"][0]["id"], INFO["id"])
-                self.assertFalse(self.window.start_button.isEnabled())
+                self.assertTrue(self.window.start_button.isEnabled())
                 self.assertTrue(self.window.pending_analyzer.wait(5000))
                 self.app.processEvents()
             self.assertEqual(self.window.url.text(), DRAMA_URL)
@@ -228,8 +228,8 @@ class GuiTests(unittest.TestCase):
         with patch("app.run_series", side_effect=process):
             worker.run()
         self.assertEqual(visited, ["1", "2"])
-        self.assertEqual(states, [("1", "téléchargement"), ("1", "erreur"),
-                                  ("2", "téléchargement"), ("2", "terminé")])
+        self.assertEqual(states, [("idrama:1", "téléchargement"), ("idrama:1", "erreur"),
+                                  ("idrama:2", "téléchargement"), ("idrama:2", "terminé")])
         worker.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
@@ -247,7 +247,7 @@ class GuiTests(unittest.TestCase):
             self.window.queue_link(first_url, "1")
             self.window.queue_link(second_url, "2")
             self.assertEqual(self.window.tree.topLevelItemCount(), 2)
-            self.assertFalse(self.window.start_button.isEnabled())
+            self.assertTrue(self.window.start_button.isEnabled())
             release.set()
             deadline = time.monotonic() + 3
             while len(self.window.data["series"]) < 2 and time.monotonic() < deadline:
@@ -280,6 +280,74 @@ class GuiTests(unittest.TestCase):
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.window = Window(Path(self.tmp.name) / "queue.json")
         self.assertEqual(self.window.data["pending_links"][0]["state"], "en attente")
+
+    def test_options_change_requeues_completed_series_without_erasing_episodes(self):
+        self.window.link_found("77", {**INFO, "id": "77", "source": "idrama"})
+        series = self.window.data["series"][0]
+        series["state"] = "terminé"
+        series["episodes"]["1"] = {"state": "terminé", "percent": 100, "speed": ""}
+        self.window.render()
+        self.window.tree.setCurrentItem(self.window.tree.topLevelItem(0))
+        self.window.merge_box.setChecked(False)
+        self.window.apply_options.click()
+        self.assertEqual(series["state"], "en attente")
+        self.assertEqual(series["episodes"]["1"]["percent"], 100)
+        self.assertFalse(series["merge"])
+        series["state"] = "terminé"
+        self.window.render()
+        self.window.tree.setCurrentItem(self.window.tree.topLevelItem(0))
+        self.window.keep_box.setChecked(False)
+        self.window.apply_options.click()
+        self.assertEqual(series["state"], "en attente")
+
+    def test_rename_does_not_change_pinned_folder(self):
+        self.window.destination.setText(self.tmp.name)
+        self.window.link_found("77", {**INFO, "id": "77", "source": "idrama"})
+        item = self.window.tree.topLevelItem(0)
+        previous = self.window.data["series"][0]["folder"]
+        item.setText(0, "Titre modifié")
+        self.assertEqual(self.window.data["series"][0]["title"], "Titre modifié")
+        self.assertEqual(self.window.data["series"][0]["folder"], previous)
+
+    def test_same_external_id_from_different_sources_is_not_a_duplicate(self):
+        self.window.destination.setText(self.tmp.name)
+        self.window.link_found("77", {**INFO, "id": "77", "source": "idrama"})
+        self.window.link_found("77", {**INFO, "id": "77", "source": "dramabox"})
+        self.assertEqual(len(self.window.data["series"]), 2)
+        self.assertNotEqual(self.window.data["series"][0]["folder"],
+                            self.window.data["series"][1]["folder"])
+        self.window.tree.setCurrentItem(self.window.tree.topLevelItem(1))
+        self.window.remove_selected.click()
+        self.assertEqual([s["source"] for s in self.window.data["series"]], ["idrama"])
+
+    def test_pending_analysis_does_not_block_ready_downloads(self):
+        self.window.destination.setText(self.tmp.name)
+        self.window.link_found("7", {**INFO, "id": "7"})
+        self.window.data["pending_links"].append({
+            "id": "8", "source": "idrama", "url": DRAMA_URL,
+            "state": "en attente", "error": ""})
+        self.window.buttons()
+        self.assertTrue(self.window.start_button.isEnabled())
+        with patch("app.Worker") as worker_class:
+            worker = worker_class.return_value
+            worker.isRunning.return_value = False
+            self.window.start_button.click()
+            self.assertEqual(len(worker_class.call_args.args[0]), 1)
+        self.window.worker = None
+
+    def test_corrupt_queue_is_preserved_instead_of_overwritten(self):
+        state_file = Path(self.tmp.name) / "queue.json"
+        self.window.close()
+        self.window.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        state_file.write_text("{not valid json", encoding="utf-8")
+        with patch("app.QMessageBox.warning") as warning:
+            self.window = Window(state_file)
+            self.assertTrue(warning.called)
+        self.assertNotEqual(self.window.state_file, state_file)
+        self.window.close()
+        self.assertEqual(state_file.read_text(encoding="utf-8"), "{not valid json")
+        self.assertTrue(self.window.state_file.exists())
 
 
 if __name__ == "__main__":
