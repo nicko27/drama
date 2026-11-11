@@ -160,27 +160,27 @@ def series_identity(series):
     return f"{series.get('source', 'idrama')}:{series['id']}"
 
 
-def assign_folder(series, destination):
-    """Pin a stable, relative folder name, preserving an existing legacy location."""
+def assign_folder(series, destination, reserved=None):
+    """Pin a stable folder, preserving old names without sharing two series' files."""
+    reserved = set(reserved or ())
+    destination = Path(destination)
     if "folder" in series:
         name = series["folder"]
-        if not isinstance(name, str) or not name or safe_name(name) != name or name in (".", ".."):
-            raise ValueError("Dossier de série invalide dans la file")
-        return Path(destination) / name
-    destination = Path(destination)
+        if not isinstance(name, str) or not name or safe_name(name) != name or name in reserved:
+            raise ValueError("Dossier de série invalide ou déjà utilisé dans la file")
+        return destination / name
     legacy = safe_name(series["title"] + "_" + series["id"])
     stable = safe_name(series_identity(series).replace(":", "_"))
-    if (destination / legacy).is_dir():
+    if (destination / legacy).is_dir() and legacy not in reserved:
         name = legacy
     else:
-        # Old releases used the displayed title in the directory name.
-        # Recover a renamed legacy directory only when there is no ambiguity.
         candidates = [p.name for p in destination.glob("*_" + series["id"])
-                      if p.is_dir() and safe_name(p.name) == p.name]
+                      if p.is_dir() and safe_name(p.name) == p.name and p.name not in reserved]
         name = candidates[0] if len(candidates) == 1 else stable
+    if name in reserved:
+        raise ValueError("Deux séries ne peuvent partager le même dossier")
     series["folder"] = name
     return destination / name
-
 
 def file_fingerprint(path):
     digest = hashlib.sha256()
@@ -394,6 +394,7 @@ def validate_queue(data):
     if not isinstance(pending, list):
         raise ValueError("Liens en attente invalides")
     seen = set()
+    folders = set()
     for index, item in enumerate(data["series"]):
         if not isinstance(item, dict):
             raise ValueError(f"Série {index} invalide")
@@ -418,8 +419,9 @@ def validate_queue(data):
             raise ValueError(f"Série {identity} : état invalide")
         if "folder" in item:
             name = item["folder"]
-            if not isinstance(name, str) or not name or safe_name(name) != name:
-                raise ValueError(f"Série {identity} : dossier invalide")
+            if not isinstance(name, str) or not name or safe_name(name) != name or name in folders:
+                raise ValueError(f"Série {identity} : dossier invalide ou dupliqué")
+            folders.add(name)
         for flag in ("merge", "keep"):
             if flag in item and type(item[flag]) is not bool:
                 raise ValueError(f"Série {identity} : option {flag} invalide")
