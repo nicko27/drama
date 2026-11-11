@@ -340,7 +340,7 @@ class Window(QMainWindow):
             l for l in self.data["pending_links"] if pending_identity(l) != key]
         if not any(series_identity(s) == key for s in self.data["series"]):
             series = {**info, "start": 1, "end": info["total"],
-                      "merge": info.get("source") != "direct" and self.merge_box.isChecked(),
+                      "merge": info.get("source") not in ("direct", "ytdlp") and self.merge_box.isChecked(),
                       "keep": self.keep_box.isChecked(),
                       "state": "en attente", "episodes": {}}
             assign_folder(series, self.destination.text(),
@@ -419,16 +419,17 @@ class Window(QMainWindow):
 
     def analysis_ok(self, info):
         self.preview = info
-        self.merge_box.setEnabled(info.get("source") != "direct")
-        self.merge_box.setChecked(info.get("source") != "direct")
+        self.merge_box.setEnabled(info.get("source") not in ("direct", "ytdlp"))
+        self.merge_box.setChecked(info.get("source") not in ("direct", "ytdlp"))
         self.start_ep.setValue(1)
         maximum = info["total"]
         self.end_ep.setValue(maximum)
         self.start_ep.setMaximum(maximum)
         self.end_ep.setMaximum(maximum)
         label = " (titre indisponible, modifiable dans la file)" if info["title_unknown"] else ""
-        detail = ("fichier direct" if info.get("source") == "direct"
-                  else f"{info['total']} épisodes — langue {info['lang']} — serveur {info['server']}")
+        detail = ("fichier direct" if info.get("source") == "direct" else
+                  "vidéo reconnue par yt-dlp" if info.get("source") == "ytdlp" else
+                  f"{info['total']} épisodes — langue {info['lang']} — serveur {info['server']}")
         self.info.setText(f"{info['title']}{label} — {detail}")
         self.analysis_tree.clear()
         self.analysis_tree.addTopLevelItem(QTreeWidgetItem(
@@ -447,7 +448,7 @@ class Window(QMainWindow):
             QMessageBox.information(self, "Déjà présent", "Cette série est déjà dans la file.")
             return
         series = {**self.preview, "start": self.start_ep.value(), "end": self.end_ep.value(),
-                  "merge": self.preview.get("source") != "direct" and self.merge_box.isChecked(),
+                  "merge": self.preview.get("source") not in ("direct", "ytdlp") and self.merge_box.isChecked(),
                   "keep": self.keep_box.isChecked(),
                   "state": "en attente", "episodes": {}}
         assign_folder(series, self.destination.text(),
@@ -524,8 +525,8 @@ class Window(QMainWindow):
             self.end_ep.setMaximum(maximum)
             self.start_ep.setValue(series["start"])
             self.end_ep.setValue(series["end"])
-            self.merge_box.setEnabled(series.get("source") != "direct")
-            self.merge_box.setChecked(series.get("merge", True) and series.get("source") != "direct")
+            self.merge_box.setEnabled(series.get("source") not in ("direct", "ytdlp"))
+            self.merge_box.setChecked(series.get("merge", True) and series.get("source") not in ("direct", "ytdlp"))
             self.keep_box.setChecked(series.get("keep", True))
 
     def link_is_running(self, ident):
@@ -574,7 +575,7 @@ class Window(QMainWindow):
             # Keep validated episodes; only the necessary operations must be rescheduled.
             series["state"] = "en attente"
         series.update(start=self.start_ep.value(), end=self.end_ep.value(),
-                      merge=series.get("source") != "direct" and self.merge_box.isChecked(),
+                      merge=series.get("source") not in ("direct", "ytdlp") and self.merge_box.isChecked(),
                       keep=self.keep_box.isChecked())
         self.persist()
         self.render()
