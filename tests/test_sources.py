@@ -113,6 +113,45 @@ class GenericSourceTests(unittest.TestCase):
                            lambda message: None, lambda message: False)
             self.assertEqual((Path(tmp) / series["folder"] /
                               series["filename"]).read_bytes(), b"abc")
+    def test_generic_ytdlp_single_video_extractor(self):
+        from sources import discover_any
+        url = "https://example.org/watch?id=34"
+        with patch("yt_dlp.YoutubeDL") as downloader:
+            downloader.return_value.__enter__.return_value.extract_info.return_value = {
+                "id": "34", "title": "A video", "vcodec": "h264"
+            }
+            info = discover_any(url)
+        self.assertEqual(info["source"], "ytdlp")
+        self.assertEqual(info["file_url"], url)
+        self.assertEqual(info["total"], 1)
+        with patch("yt_dlp.YoutubeDL") as downloader:
+            downloader.return_value.__enter__.return_value.extract_info.return_value = {
+                "_type": "playlist", "entries": [{"title": "episode"}]
+            }
+            with self.assertRaisesRegex(RuntimeError, "Playlist"):
+                discover_any(url)
+
+    def test_ytdlp_uses_video_page_without_legacy_api_or_referer(self):
+        from engine import download_episode
+        url = "https://example.org/watch?id=34"
+        series = {"id": "34", "source": "ytdlp", "file_url": url,
+                  "server": 1, "lang": "en"}
+        probe = {"streams": [{"codec_type": "video", "codec_name": "h264"}],
+                 "format": {"duration": "2"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            calls = []
+            def fake_run(command, line=None):
+                calls.append(command)
+                (folder / "Episode_01.mp4").write_bytes(b"video")
+            controller = Controller()
+            with patch.object(controller, "run", fake_run), patch("engine.query_api") as api, \
+                 patch("engine.probe", return_value=probe):
+                path = download_episode(series, 1, folder, controller, lambda *args: None)
+                self.assertTrue(path.is_file())
+                self.assertEqual(calls[0][-1], url)
+                self.assertNotIn("--referer", calls[0])
+                api.assert_not_called()
 
 
 if __name__ == "__main__":
