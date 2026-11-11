@@ -15,6 +15,17 @@ from sources import discover_any as discover, parse_any as parse_url
 from engine import (Cancelled, Controller, assign_folder, load_queue, run_series,
                     save_queue, series_identity)
 
+def pending_identity(link):
+    """Resolve old queue entries that predate the explicit source field."""
+    source = link.get("source")
+    if not source:
+        try:
+            source = parse_url(link["url"])["source"]
+        except ValueError:
+            source = "idrama"
+    return f"{source}:{link['id']}"
+
+
 STATE_FILE = Path.home() / "Library" / "Application Support" / "DramaFren Downloader" / "queue.json"
 ICON_FILE = Path(__file__).resolve().parent / "assets" / "icon.png"
 
@@ -283,7 +294,7 @@ class Window(QMainWindow):
         source = parse_url(url)["source"]
         key = f"{source}:{ident}"
         if any(series_identity(s) == key for s in self.data["series"]) or any(
-                series_identity(l) == key for l in self.data["pending_links"]):
+                pending_identity(l) == key for l in self.data["pending_links"]):
             return
         self.data["pending_links"].append(
             {"id": ident, "source": source, "url": url, "state": "en attente", "error": ""})
@@ -302,7 +313,7 @@ class Window(QMainWindow):
         self.persist()
         self.render()
         self.buttons()
-        self.pending_current_id = series_identity(link)
+        self.pending_current_id = pending_identity(link)
         self.pending_analyzer = Analyzer(link["url"])
         self.pending_analyzer.found.connect(
             lambda info, key=self.pending_current_id: self.link_found(key, info))
@@ -323,7 +334,7 @@ class Window(QMainWindow):
             return
         key = series_identity(info)
         self.data["pending_links"] = [
-            l for l in self.data["pending_links"] if series_identity(l) != key]
+            l for l in self.data["pending_links"] if pending_identity(l) != key]
         if not any(series_identity(s) == key for s in self.data["series"]):
             series = {**info, "start": 1, "end": info["total"],
                       "merge": info.get("source") != "direct" and self.merge_box.isChecked(),
@@ -343,7 +354,7 @@ class Window(QMainWindow):
         if self.closing:
             return
         for link in self.data["pending_links"]:
-            if series_identity(link) == ident or (":" not in ident and link["id"] == ident):
+            if pending_identity(link) == ident or (":" not in ident and link["id"] == ident):
                 link["state"] = "erreur"
                 link["error"] = error
         self.journal.appendPlainText(f"Analyse {ident} : {error}")
@@ -380,7 +391,7 @@ class Window(QMainWindow):
             parsed = parse_url(url)
             wanted = f"{parsed['source']}:{parsed['id']}"
             link = next((link for link in self.data["pending_links"]
-                         if series_identity(link) == wanted), None)
+                         if pending_identity(link) == wanted), None)
             if link:
                 if link["state"] == "erreur":
                     self.info.setText(f"Déjà dans la file : {link['error']} — sélectionnez la ligne pour réessayer.")
@@ -396,8 +407,12 @@ class Window(QMainWindow):
         self.analyzer = Analyzer(url)
         self.analyzer.found.connect(self.analysis_ok)
         self.analyzer.failed.connect(self.analysis_error)
-        self.analyzer.finished.connect(lambda: self.analyze.setEnabled(True))
+        self.analyzer.finished.connect(self.analysis_finished)
         self.analyzer.start()
+
+    def analysis_finished(self):
+        if not self.closing:
+            self.analyze.setEnabled(True)
 
     def analysis_ok(self, info):
         self.preview = info
@@ -436,7 +451,7 @@ class Window(QMainWindow):
                       reserved={item["folder"] for item in self.data["series"]})
         self.data["series"].append(series)
         self.data["pending_links"] = [
-            l for l in self.data["pending_links"] if series_identity(l) != series_identity(series)]
+            l for l in self.data["pending_links"] if pending_identity(l) != series_identity(series)]
         self.persist()
         self.preview = None
         self.render()
@@ -459,7 +474,7 @@ class Window(QMainWindow):
         self.tree.clear()
         for link in self.data["pending_links"]:
             item = QTreeWidgetItem(self.tree, [f"Lien {link['id']}", "à analyser", "", "", link["state"]])
-            item.setData(0, Qt.ItemDataRole.UserRole, ("pending", series_identity(link)))
+            item.setData(0, Qt.ItemDataRole.UserRole, ("pending", pending_identity(link)))
             item.setToolTip(0, link["url"])
             if link["error"]:
                 item.setToolTip(4, link["error"])
@@ -496,7 +511,7 @@ class Window(QMainWindow):
         self.remove_selected.setEnabled(bool(entry) and not busy and
                                         (entry[0] != "pending" or not self.link_is_running(entry[1])))
         self.retry_link.setEnabled(bool(entry) and entry[0] == "pending" and any(
-            series_identity(l) == entry[1] and l["state"] == "erreur" for l in self.data["pending_links"]))
+            pending_identity(l) == entry[1] and l["state"] == "erreur" for l in self.data["pending_links"]))
         self.apply_options.setEnabled(bool(entry) and entry[0] == "series" and not busy)
         if entry and entry[0] == "series":
             series = self.series_for(entry[1])
@@ -510,14 +525,14 @@ class Window(QMainWindow):
             self.keep_box.setChecked(series.get("keep", True))
 
     def link_is_running(self, ident):
-        return any(series_identity(l) == ident and l["state"] == "analyse" for l in self.data["pending_links"])
+        return any(pending_identity(l) == ident and l["state"] == "analyse" for l in self.data["pending_links"])
 
     def retry_selected(self):
         entry = self.selected_entry()
         if not entry or entry[0] != "pending":
             return
         for link in self.data["pending_links"]:
-            if series_identity(link) == entry[1] and link["state"] == "erreur":
+            if pending_identity(link) == entry[1] and link["state"] == "erreur":
                 link.update(state="en attente", error="")
                 self.persist()
                 self.render()
@@ -532,7 +547,7 @@ class Window(QMainWindow):
         if kind == "pending":
             if self.link_is_running(ident):
                 return
-            self.data["pending_links"] = [l for l in self.data["pending_links"] if series_identity(l) != ident]
+            self.data["pending_links"] = [l for l in self.data["pending_links"] if pending_identity(l) != ident]
         else:
             self.data["series"] = [s for s in self.data["series"] if series_identity(s) != ident]
         self.persist()
@@ -613,7 +628,7 @@ class Window(QMainWindow):
             matching = [s for s in self.data["series"] if s["id"] == ident]
         if len(matching) != 1:
             raise KeyError(f"Identifiant de série absent ou ambigu : {ident}")
-        return matching
+        return matching[0]
 
     def on_progress(self, ident, ep, state, percent, speed, message):
         series = self.series_for(ident)
