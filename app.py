@@ -8,10 +8,10 @@ from PySide6.QtCore import QThread, QTimer, Signal, Qt
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (QApplication, QCheckBox, QFileDialog, QGridLayout,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
-    QProgressBar, QPushButton, QSpinBox, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+    QProgressBar, QPushButton, QSpinBox, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
     QWidget)
 
-from dramafren_downloader import discover, parse_url
+from sources import discover_any as discover, parse_any as parse_url
 from engine import (Cancelled, Controller, assign_folder, load_queue, run_series,
                     save_queue, series_identity)
 
@@ -140,22 +140,30 @@ class Window(QMainWindow):
         self.progress_timer.timeout.connect(self.flush_progress)
         self.pending_url = None
         self.last_clipboard_text = QApplication.clipboard().text().strip()
-        self.setWindowTitle("DramaFren Downloader")
+        self.setWindowTitle("Drama Downloader")
         self.setWindowIcon(QIcon(str(ICON_FILE)))
-        self.resize(880, 580)
+        self.resize(1000, 660)
         root = QWidget()
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
+        self.tabs = QTabWidget()
+        analysis_page = QWidget()
+        downloads_page = QWidget()
+        analysis_layout = QVBoxLayout(analysis_page)
+        downloads_layout = QVBoxLayout(downloads_page)
+        self.tabs.addTab(analysis_page, "Analyseur de liens")
+        self.tabs.addTab(downloads_page, "Téléchargements")
+        layout.addWidget(self.tabs)
         top = QHBoxLayout()
         self.url = QLineEdit()
-        self.url.setPlaceholderText("Coller une URL DramaFren…")
+        self.url.setPlaceholderText("Coller une URL de série ou de fichier HTTP/HTTPS…")
         self.analyze = QPushButton("Analyser")
         self.add = QPushButton("Ajouter à la file")
         self.add.setEnabled(False)
         top.addWidget(self.url, 1)
         top.addWidget(self.analyze)
         top.addWidget(self.add)
-        layout.addLayout(top)
+        analysis_layout.addLayout(top)
         clipboard_row = QHBoxLayout()
         self.watch_clipboard = QCheckBox("Détecter les liens copiés")
         self.watch_clipboard.setChecked(True)
@@ -164,9 +172,9 @@ class Window(QMainWindow):
         clipboard_row.addWidget(self.watch_clipboard)
         clipboard_row.addWidget(self.use_clipboard)
         clipboard_row.addStretch()
-        layout.addLayout(clipboard_row)
+        analysis_layout.addLayout(clipboard_row)
         self.info = QLabel("Collez une URL pour identifier la série.")
-        layout.addWidget(self.info)
+        analysis_layout.addWidget(self.info)
         options = QHBoxLayout()
         self.start_ep = QSpinBox()
         self.end_ep = QSpinBox()
@@ -181,22 +189,27 @@ class Window(QMainWindow):
                        self.merge_box, self.keep_box, self.apply_options):
             options.addWidget(widget)
         options.addStretch()
-        layout.addLayout(options)
+        analysis_layout.addLayout(options)
+        self.analysis_tree = QTreeWidget()
+        self.analysis_tree.setHeaderLabels(["Lien / fichier", "Éléments", "État"])
+        analysis_layout.addWidget(self.analysis_tree, 1)
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Nom / épisode", "Épisodes", "Progression", "Vitesse", "État"])
         self.tree.setColumnWidth(0, 280)
         self.tree.itemChanged.connect(self.rename_series)
         self.tree.itemSelectionChanged.connect(self.selection_changed)
-        layout.addWidget(self.tree, 1)
+        downloads_layout.addWidget(self.tree, 1)
         queue_controls = QHBoxLayout()
         self.retry_link = QPushButton("Réessayer l’analyse")
         self.remove_selected = QPushButton("Retirer la sélection")
+        self.edit_selected = QPushButton("Options de la sélection")
         queue_controls.addWidget(self.retry_link)
         queue_controls.addWidget(self.remove_selected)
+        queue_controls.addWidget(self.edit_selected)
         queue_controls.addStretch()
-        layout.addLayout(queue_controls)
+        downloads_layout.addLayout(queue_controls)
         self.global_bar = QProgressBar()
-        layout.addWidget(self.global_bar)
+        downloads_layout.addWidget(self.global_bar)
         bottom = QGridLayout()
         self.destination = QLineEdit(self.data.get("destination", str(Path.home() / "Downloads")))
         browse = QPushButton("Parcourir…")
@@ -217,12 +230,12 @@ class Window(QMainWindow):
         self.stop_button = QPushButton("Arrêter")
         for col, button in enumerate((self.start_button, self.pause_button, self.resume_button, self.stop_button), 3):
             bottom.addWidget(button, 1, col)
-        layout.addLayout(bottom)
-        layout.addWidget(QLabel("Journal d’activité"))
+        downloads_layout.addLayout(bottom)
+        downloads_layout.addWidget(QLabel("Journal d’activité"))
         self.journal = QPlainTextEdit()
         self.journal.setReadOnly(True)
         self.journal.setMaximumHeight(100)
-        layout.addWidget(self.journal)
+        downloads_layout.addWidget(self.journal)
         self.setStyleSheet("QMainWindow{background:#f4f6f9} QPushButton{padding:6px 10px} "
                            "QTreeWidget,QPlainTextEdit,QLineEdit{background:white;border:1px solid #ccd3dd;border-radius:4px} "
                            "QProgressBar{border:1px solid #ccd3dd;border-radius:4px;text-align:center} "
@@ -232,6 +245,7 @@ class Window(QMainWindow):
         self.apply_options.clicked.connect(self.apply_to_series)
         self.retry_link.clicked.connect(self.retry_selected)
         self.remove_selected.clicked.connect(self.remove_selection)
+        self.edit_selected.clicked.connect(lambda: self.tabs.setCurrentIndex(0))
         self.url.textChanged.connect(lambda: self.add.setEnabled(False))
         self.watch_clipboard.toggled.connect(self.clipboard_toggled)
         self.use_clipboard.clicked.connect(self.use_copied_url)
@@ -326,7 +340,8 @@ class Window(QMainWindow):
             l for l in self.data["pending_links"] if pending_identity(l) != key]
         if not any(series_identity(s) == key for s in self.data["series"]):
             series = {**info, "start": 1, "end": info["total"],
-                      "merge": self.merge_box.isChecked(), "keep": self.keep_box.isChecked(),
+                      "merge": info.get("source") != "direct" and self.merge_box.isChecked(),
+                      "keep": self.keep_box.isChecked(),
                       "state": "en attente", "episodes": {}}
             assign_folder(series, self.destination.text(),
                           reserved={item["folder"] for item in self.data["series"]})
@@ -404,13 +419,20 @@ class Window(QMainWindow):
 
     def analysis_ok(self, info):
         self.preview = info
+        self.merge_box.setEnabled(info.get("source") != "direct")
+        self.merge_box.setChecked(info.get("source") != "direct")
         self.start_ep.setValue(1)
         maximum = info["total"]
         self.end_ep.setValue(maximum)
         self.start_ep.setMaximum(maximum)
         self.end_ep.setMaximum(maximum)
         label = " (titre indisponible, modifiable dans la file)" if info["title_unknown"] else ""
-        self.info.setText(f"{info['title']}{label} — {info['total']} épisodes — langue {info['lang']} — serveur {info['server']}")
+        detail = ("fichier direct" if info.get("source") == "direct"
+                  else f"{info['total']} épisodes — langue {info['lang']} — serveur {info['server']}")
+        self.info.setText(f"{info['title']}{label} — {detail}")
+        self.analysis_tree.clear()
+        self.analysis_tree.addTopLevelItem(QTreeWidgetItem(
+            [info["title"], str(info["total"]), "Prêt à ajouter"]))
         self.add.setEnabled(True)
 
     def analysis_error(self, error):
@@ -425,7 +447,8 @@ class Window(QMainWindow):
             QMessageBox.information(self, "Déjà présent", "Cette série est déjà dans la file.")
             return
         series = {**self.preview, "start": self.start_ep.value(), "end": self.end_ep.value(),
-                  "merge": self.merge_box.isChecked(), "keep": self.keep_box.isChecked(),
+                  "merge": self.preview.get("source") != "direct" and self.merge_box.isChecked(),
+                  "keep": self.keep_box.isChecked(),
                   "state": "en attente", "episodes": {}}
         assign_folder(series, self.destination.text(),
                       reserved={item["folder"] for item in self.data["series"]})
@@ -433,10 +456,19 @@ class Window(QMainWindow):
         self.data["pending_links"] = [
             l for l in self.data["pending_links"] if pending_identity(l) != series_identity(series)]
         self.persist()
+        self.preview = None
         self.render()
         self.add.setEnabled(False)
+        self.tabs.setCurrentIndex(1)
 
     def render(self):
+        self.analysis_tree.clear()
+        for link in self.data["pending_links"]:
+            self.analysis_tree.addTopLevelItem(QTreeWidgetItem(
+                [link["url"], "", link["state"]]))
+        if self.preview:
+            self.analysis_tree.addTopLevelItem(QTreeWidgetItem(
+                [self.preview["title"], str(self.preview["total"]), "Prêt à ajouter"]))
         selected = self.selected_entry()
         expanded = {item.data(0, Qt.ItemDataRole.UserRole) for item in
                     (self.tree.topLevelItem(i) for i in range(self.tree.topLevelItemCount()))
@@ -484,6 +516,7 @@ class Window(QMainWindow):
         self.retry_link.setEnabled(bool(entry) and entry[0] == "pending" and any(
             pending_identity(l) == entry[1] and l["state"] == "erreur" for l in self.data["pending_links"]))
         self.apply_options.setEnabled(bool(entry) and entry[0] == "series" and not busy)
+        self.edit_selected.setEnabled(bool(entry) and entry[0] == "series" and not busy)
         if entry and entry[0] == "series":
             series = self.series_for(entry[1])
             maximum = series["total"]
@@ -491,7 +524,8 @@ class Window(QMainWindow):
             self.end_ep.setMaximum(maximum)
             self.start_ep.setValue(series["start"])
             self.end_ep.setValue(series["end"])
-            self.merge_box.setChecked(series.get("merge", True))
+            self.merge_box.setEnabled(series.get("source") != "direct")
+            self.merge_box.setChecked(series.get("merge", True) and series.get("source") != "direct")
             self.keep_box.setChecked(series.get("keep", True))
 
     def link_is_running(self, ident):
@@ -540,7 +574,8 @@ class Window(QMainWindow):
             # Keep validated episodes; only the necessary operations must be rescheduled.
             series["state"] = "en attente"
         series.update(start=self.start_ep.value(), end=self.end_ep.value(),
-                      merge=self.merge_box.isChecked(), keep=self.keep_box.isChecked())
+                      merge=series.get("source") != "direct" and self.merge_box.isChecked(),
+                      keep=self.keep_box.isChecked())
         self.persist()
         self.render()
 

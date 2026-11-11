@@ -9,6 +9,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+import urllib.request
+import urllib.error
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -324,7 +326,122 @@ def merge(series, folder, episodes, controller, reencode_prompt, keep=True):
         temp.unlink(missing_ok=True)
 
 
+def direct_paths(series, folder):
+    from sources import direct_filename
+    name = direct_filename(series["file_url"])
+    if name != series.get("filename"):
+        raise ValueError("Nom ou URL de téléchargement direct incohérent")
+    target = folder / name
+    return target, Path(str(target) + ".part"), Path(str(target) + ".download.json"), Path(str(target) + ".partial.json")
+
+
+def verified_direct(series, folder):
+    target, _, proof, _ = direct_paths(series, folder)
+    try:
+        metadata = json.loads(proof.read_text(encoding="utf-8"))
+        if (metadata.get("url") == series["file_url"] and target.is_file()
+                and file_fingerprint(target) == metadata.get("fingerprint")):
+            return target
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def download_direct(series, folder, controller, update):
+    """Download generic HTTP files; resume only with a server validator."""
+    target, partial, proof, partial_meta = direct_paths(series, folder)
+    found = verified_direct(series, folder)
+    if found:
+        update(1, "terminé", 100, "", "Fichier déjà vérifié")
+        return found
+    if target.exists():
+        raise RuntimeError(f"Fichier existant non vérifié, conservé sans écrasement : {target}")
+    url = series["file_url"]
+    metadata = {}
+    try:
+        metadata = json.loads(partial_meta.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    resume_token = metadata.get("etag") or metadata.get("last_modified")
+    can_resume = (partial.is_file() and metadata.get("url") == url and resume_token)
+    offset = partial.stat().st_size if can_resume else 0
+    headers = {"User-Agent": "Drama Downloader/1.0"}
+    if offset:
+        headers["Range"] = f"bytes={offset}-"
+        headers["If-Range"] = resume_token
+    request = urllib.request.Request(url, headers=headers)
+    controller.wait()
+    with urllib.request.urlopen(request, timeout=30) as response:
+        status = response.status
+        if status not in (200, 206):
+            raise RuntimeError(f"Réponse HTTP inattendue : {status}")
+        if status == 206:
+            content_range = response.headers.get("Content-Range", "")
+            if not offset or not content_range.startswith(f"bytes {offset}-"):
+                raise RuntimeError("Réponse HTTP Range incohérente : reprise refusée")
+            if (metadata.get("etag") and response.headers.get("ETag")
+                    and response.headers["ETag"] != metadata["etag"]):
+                raise RuntimeError("Fichier distant modifié : reprise refusée")
+        else:
+            # The server may ignore Range: safely restart the partial transfer.
+            offset = 0
+        length = response.headers.get("Content-Length")
+        total = offset + int(length) if length and length.isdecimal() else None
+        if status == 206 and "/" in response.headers.get("Content-Range", ""):
+            declared = response.headers["Content-Range"].rsplit("/", 1)[-1]
+            if declared.isdecimal() and total is not None and int(declared) != total:
+                raise RuntimeError("Taille totale HTTP incohérente")
+        etag = response.headers.get("ETag")
+        modified = response.headers.get("Last-Modified")
+        write_json_atomic(partial_meta, {"url": url, "etag": etag,
+                                         "last_modified": modified, "total": total})
+        done = offset
+        started = time.monotonic()
+        with partial.open("ab" if offset else "wb") as output:
+            while True:
+                controller.wait()
+                chunk = response.read(256 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+                done += len(chunk)
+                elapsed = max(0.001, time.monotonic() - started)
+                speed = f"{((done - offset) / elapsed) / (1024 * 1024):.1f} Mo/s"
+                update(1, "téléchargement", min(100, 100 * done / total) if total else 0,
+                       speed, "")
+        if total is not None and done != total:
+            raise RuntimeError(f"Téléchargement incomplet ({done}/{total} octets)")
+    controller.wait()
+    fingerprint = file_fingerprint(partial)
+    os.replace(partial, target)
+    write_json_atomic(proof, {"url": url, "fingerprint": fingerprint})
+    partial_meta.unlink(missing_ok=True)
+    update(1, "terminé", 100, "", "")
+    return target
+
+
+def run_direct(series, folder, controller, update, log):
+    for attempt in range(3):
+        controller.wait()
+        try:
+            result = download_direct(series, folder, controller, update)
+            log(f"Fichier vérifié : {result}")
+            return
+        except Cancelled:
+            raise
+        except (RuntimeError, OSError, ValueError, urllib.error.URLError) as exc:
+            update(1, "erreur", 0, "", str(exc))
+            if attempt == 2:
+                raise RuntimeError(f"Fichier direct : {exc}") from exc
+            if controller.stop.wait(2):
+                raise Cancelled()
+
+
 def run_series(series, destination, parallel, controller, update, log, reencode_prompt):
+    if series.get("source") == "direct":
+        folder = assign_folder(series, destination)
+        folder.mkdir(parents=True, exist_ok=True)
+        return run_direct(series, folder, controller, update, log)
     if not importlib.util.find_spec("yt_dlp") or not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
         raise RuntimeError("yt-dlp, ffmpeg et ffprobe sont requis (voir README)")
     folder = assign_folder(series, destination)
