@@ -202,8 +202,10 @@ class Window(QMainWindow):
         queue_controls = QHBoxLayout()
         self.retry_link = QPushButton("Réessayer l’analyse")
         self.remove_selected = QPushButton("Retirer la sélection")
+        self.edit_selected = QPushButton("Options de la sélection")
         queue_controls.addWidget(self.retry_link)
         queue_controls.addWidget(self.remove_selected)
+        queue_controls.addWidget(self.edit_selected)
         queue_controls.addStretch()
         downloads_layout.addLayout(queue_controls)
         self.global_bar = QProgressBar()
@@ -243,6 +245,7 @@ class Window(QMainWindow):
         self.apply_options.clicked.connect(self.apply_to_series)
         self.retry_link.clicked.connect(self.retry_selected)
         self.remove_selected.clicked.connect(self.remove_selection)
+        self.edit_selected.clicked.connect(lambda: self.tabs.setCurrentIndex(0))
         self.url.textChanged.connect(lambda: self.add.setEnabled(False))
         self.watch_clipboard.toggled.connect(self.clipboard_toggled)
         self.use_clipboard.clicked.connect(self.use_copied_url)
@@ -513,6 +516,7 @@ class Window(QMainWindow):
         self.retry_link.setEnabled(bool(entry) and entry[0] == "pending" and any(
             pending_identity(l) == entry[1] and l["state"] == "erreur" for l in self.data["pending_links"]))
         self.apply_options.setEnabled(bool(entry) and entry[0] == "series" and not busy)
+        self.edit_selected.setEnabled(bool(entry) and entry[0] == "series" and not busy)
         if entry and entry[0] == "series":
             series = self.series_for(entry[1])
             maximum = series["total"]
