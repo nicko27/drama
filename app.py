@@ -103,10 +103,12 @@ class Window(QMainWindow):
                                 f"{exc}\n\nLa file originale reste intacte : {original}\n"
                                 f"Cette session sera enregistrée dans : {self.state_file}")
         self.data.setdefault("pending_links", [])
+        used_folders = set()
         for series in self.data["series"]:
             if series.get("source") == "dramabox":
                 series.pop("available_end", None)  # ancienne limite erronée du catalogue tiers
-            assign_folder(series, self.data["destination"])
+            assign_folder(series, self.data["destination"], reserved=used_folders)
+            used_folders.add(series["folder"])
         for link in self.data["pending_links"]:
             if "source" not in link:
                 try:
@@ -315,7 +317,8 @@ class Window(QMainWindow):
             series = {**info, "start": 1, "end": info["total"],
                       "merge": self.merge_box.isChecked(), "keep": self.keep_box.isChecked(),
                       "state": "en attente", "episodes": {}}
-            assign_folder(series, self.destination.text())
+            assign_folder(series, self.destination.text(),
+                          reserved={item["folder"] for item in self.data["series"]})
             self.data["series"].append(series)
             self.journal.appendPlainText(f"Ajouté à la file : {info['title']} ({info['total']} épisodes)")
             if info.get("title_unknown"):
@@ -409,7 +412,8 @@ class Window(QMainWindow):
         series = {**self.preview, "start": self.start_ep.value(), "end": self.end_ep.value(),
                   "merge": self.merge_box.isChecked(), "keep": self.keep_box.isChecked(),
                   "state": "en attente", "episodes": {}}
-        assign_folder(series, self.destination.text())
+        assign_folder(series, self.destination.text(),
+                      reserved={item["folder"] for item in self.data["series"]})
         self.data["series"].append(series)
         self.data["pending_links"] = [
             l for l in self.data["pending_links"] if series_identity(l) != series_identity(series)]
