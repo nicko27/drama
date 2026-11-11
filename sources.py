@@ -20,7 +20,7 @@ DIRECT_EXTENSIONS = frozenset({
 })
 
 
-def direct_filename(url):
+def validate_public_url(url):
     parsed = urlsplit(url.strip())
     if parsed.scheme not in ("https", "http") or not parsed.hostname or parsed.username or parsed.password:
         raise ValueError("Une URL HTTP/HTTPS valide est nécessaire")
@@ -34,6 +34,11 @@ def direct_filename(url):
     else:
         if not ip.is_global:
             raise ValueError("Les adresses IP non publiques ne sont pas prises en charge")
+    return parsed
+
+
+def direct_filename(url):
+    parsed = validate_public_url(url)
     name = unquote(PurePosixPath(parsed.path).name)
     if not name or len(name) > 200 or "/" in name or "\\" in name:
         raise ValueError("Nom de fichier impossible à déterminer depuis l'URL")
@@ -42,7 +47,6 @@ def direct_filename(url):
         raise ValueError("Cette URL n'est pas un fichier direct reconnu")
     stem = re.sub(r"[^\w -]", "_", name[:-len(extension)]).strip(" ._") or "fichier"
     return stem[:120] + extension
-
 
 def parse_any(url):
     try:
@@ -54,8 +58,41 @@ def parse_any(url):
                 "filename": filename}
 
 
+def discover_ytdlp(url):
+    """One accessible video per package for the initial generic extractor."""
+    validate_public_url(url)
+    try:
+        import yt_dlp
+    except ImportError as exc:
+        raise RuntimeError("yt-dlp est requis pour analyser cette page") from exc
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True,
+                               "noplaylist": True, "skip_download": True}) as client:
+            data = client.extract_info(url, download=False)
+    except Exception as exc:
+        raise RuntimeError(f"Extraction yt-dlp impossible : {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("Aucune vidéo identifiable sur cette page")
+    if data.get("_type") in ("playlist", "multi_video") or data.get("entries") is not None:
+        raise RuntimeError("Playlist générique non encore prise en charge : connecteur nécessaire")
+    if data.get("is_live"):
+        raise RuntimeError("Flux en direct non encore pris en charge")
+    if data.get("vcodec") == "none":
+        raise RuntimeError("La première version générique accepte uniquement les vidéos")
+    title = data.get("title")
+    if not isinstance(title, str) or not title.strip():
+        title = "Vidéo_" + hashlib.sha256(url.encode()).hexdigest()[:10]
+    return {"id": hashlib.sha256(url.strip().encode()).hexdigest()[:24],
+            "source": "ytdlp", "server": 1, "lang": "en", "total": 1,
+            "title": title.strip(), "title_unknown": False,
+            "file_url": url.strip(), "start": 1, "end": 1}
+
+
 def discover_any(url):
-    parsed = parse_any(url)
+    try:
+        parsed = parse_any(url)
+    except ValueError:
+        return discover_ytdlp(url)
     if parsed["source"] != "direct":
         return discover_drama(url)
     return {**parsed, "title": parsed["filename"], "title_unknown": False,
