@@ -32,6 +32,23 @@ class GuiTests(unittest.TestCase):
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.tmp.cleanup()
 
+    def test_mvp_tabs_and_generic_file_preview(self):
+        from sources import discover_any
+        url = "https://example.org/files/test.zip"
+        self.assertEqual(self.window.tabs.count(), 2)
+        self.assertEqual(self.window.tabs.tabText(0), "Analyseur de liens")
+        self.assertEqual(self.window.tabs.tabText(1), "Téléchargements")
+        self.window.url.setText(url)
+        with patch("app.discover", return_value=discover_any(url)):
+            self.window.analyze_url()
+            self.assertTrue(self.window.analyzer.wait(5000))
+            self.app.processEvents()
+        self.assertFalse(self.window.merge_box.isEnabled())
+        self.window.add.click()
+        self.assertEqual(self.window.data["series"][0]["source"], "direct")
+        self.assertFalse(self.window.data["series"][0]["merge"])
+        self.assertEqual(self.window.tabs.currentIndex(), 1)
+
     def test_analyze_add_and_persist(self):
         self.window.url.setText("https://example.org")
         with patch("app.discover", return_value={"id": "12", "title": "Exemple", "total": 3,
