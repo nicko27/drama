@@ -127,8 +127,12 @@ def download_episode(series, episode, folder, controller, update):
         controller.wait()
         try:
             # Nouvelle URL à chaque tentative : ne jamais conserver les liens signés.
-            for url in query_api(series["id"], episode, series["server"], series["lang"],
-                                 source=series.get("source", "idrama")):
+            if series.get("source") == "ytdlp":
+                candidates = [series["file_url"]]
+            else:
+                candidates = query_api(series["id"], episode, series["server"], series["lang"],
+                                       source=series.get("source", "idrama"))
+            for url in candidates:
                 controller.wait()
                 update(episode, "téléchargement", 0, "", f"Tentative {attempt + 1}/3")
 
@@ -138,10 +142,12 @@ def download_episode(series, episode, folder, controller, update):
                         update(episode, "téléchargement", float(match[1]), match[2], "")
 
                 try:
-                    controller.run([sys.executable, "-m", "yt_dlp", "--no-playlist", "--continue", "--no-overwrites",
-                                    "--newline", "--retries", "3", "--fragment-retries", "3",
-                                    "--referer", referer_for(series.get("source", "idrama")),
-                                    "-o", str(folder / f"Episode_{episode:02d}.%(ext)s"), url], on_line)
+                    command = [sys.executable, "-m", "yt_dlp", "--no-playlist", "--continue", "--no-overwrites",
+                               "--newline", "--retries", "3", "--fragment-retries", "3"]
+                    if series.get("source") != "ytdlp":
+                        command += ["--referer", referer_for(series.get("source", "idrama"))]
+                    command += ["-o", str(folder / f"Episode_{episode:02d}.%(ext)s"), url]
+                    controller.run(command, on_line)
                     found = existing_video(folder, episode)
                     if not found:
                         raise RuntimeError("yt-dlp a terminé sans fichier vidéo valide")
