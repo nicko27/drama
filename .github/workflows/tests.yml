@@ -10,6 +10,7 @@ on:
     branches:
       - master
       - work/drama-stabilisation-multisource
+      - work/drama-mvp-generaliste
 
 jobs:
   tests:
